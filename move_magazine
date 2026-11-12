@@ -1403,7 +1403,8 @@ async def place_on_target():
         lo, hi = world_bounds(load)
         now = 0.5 * (lo + hi)
         now[UP_I] = lo[UP_I]
-        v = target - now                      # small final correction
+        v = target - now
+        v[H_IDX] = 0.0                     # small final correction
         start_world = world_matrix(load)
         await animate(0.4, lambda a: load_world_op(
             start_world * translate_m(v * a)))
