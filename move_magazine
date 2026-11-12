@@ -1,0 +1,1503 @@
+# ============================================================
+# OHT RAIL FOLLOWER - MOVE A MAGAZINE FROM MACHINE 1 TO MACHINE 2
+# ISAAC SIM 6.0  -  run from the Script Editor
+# ============================================================
+#
+# "Drives straight, then stops before the curve" means the straight rail
+# and the curve are NOT connected in the track data. Usually one of:
+#   a) the curves live in a different prim than Track_Edges,
+#   b) the curve starts a few cm/mm away from where the straight ends,
+#   c) the curve was drawn in the opposite direction.
+# This script builds the missing junction curves itself (cyan lines in the
+# viewport) and drives the OHT along the rails until a real dead end.
+# ============================================================
+
+import asyncio
+import heapq
+import math
+import time
+from collections import defaultdict
+
+import numpy as np
+import omni.kit.app
+import omni.usd
+from pxr import Gf, Usd, UsdGeom, Vt
+
+stage = omni.usd.get_context().get_stage()
+app = omni.kit.app.get_app()
+
+# Root of the tracking network: EVERY BasisCurves prim below it is used
+TRACK_ROOT = "/World/OHT_Waypoint_Network"
+OHT_HINT = "/World/OHT2grip_Revised"   # the OHT that drives and picks
+HIDE_PRIMS = ["/World/OHT_ASE"]       # other OHT models to hide (eye icon brings them back)
+DEBUG_ROOT = "/World/OHT_Debug"
+SHOW_DEAD_END_MARKERS = False
+
+SPEED = 0.5            # metres / second
+AT_JUNCTION = "turn"   # "turn" = take the curve, "straight" = keep straight
+SAMPLE_STEP = 0.02     # metres between sampled points on the rail
+SNAP_TOL = 0.05        # metres: endpoints closer than this are one node
+JUNCTION_RADIUS = 2.0  # metres: rail ends this close are joined through a junction
+MAX_TURN_DEG = 100.0   # largest turn allowed through a junction (90 = corner)
+BIDIRECTIONAL = True   # ignore the drawing direction of the curves
+HEADING_SPAN = 0.15    # metres: tangent measured over this span
+AUTO_ALIGN = True      # turn the OHT so its long side follows the rail
+YAW_OFFSET_DEG = 0.0   # extra turn: 90 / 180 / -90 if it still faces wrong
+HEIGHT_OFFSET = 0.1   # metres: + moves the OHT up, - down, from "top on rail"
+TIME = Usd.TimeCode.Default()
+
+
+# ------------------------------------------------------------
+# Magazine transfer: pick at machine 1, place at machine 2
+# ------------------------------------------------------------
+PICK_MACHINE_PATH = "/World/Ground_Machine_1"   # machine the magazine sits on
+PLACE_MACHINE_PATH = "/World/Ground_Machine_2"  # machine to put it on
+MAGAZINE_PATH = "/World/full"     # e.g. "/World/Magazine_1"; "" = auto-find on machine 1
+PLACE_MODE = "target"  # "target" = put it exactly on the green drop-target box
+                       # "surface" = put it on whatever surface is under it
+PLACE_TARGET_PATH = "/World/Magazine_Drop_Target"  # move this box inside machine 2
+PLACE_SURFACE_PATH = ""  # surface mode only: load-port prim to set it down on
+PLACE_POINT = None     # surface mode only: (x, y) world metres, e.g. (14.2, -3.1)
+CONTINUE_AFTER_PLACE = False  # True = keep driving the rail afterwards
+MAX_RAIL_OFFSET = 0.5  # metres: stop point must be this close to a rail
+HOIST_PATH = ""        # the gripper plate that goes down; "" = auto-find
+# If the gripper is made of several parts (plate, fingers, sensor...), list
+# them all here; they are lowered together. Overrides HOIST_PATH.
+HOIST_PATHS = [
+    # "/World/OHT2grip_Revised/Gripper_Plate",
+    # "/World/OHT2grip_Revised/Gripper_Finger_L",
+]
+LIST_OHT_PARTS = False  # print the parts inside the OHT to help pick the hoist
+BUILD_HOIST = True     # build a hoist unit (plate + 2 claws) inside the OHT body.
+                       # Used unless HOIST_PATH / HOIST_PATHS is set.
+CLAW_OPEN = 0.03       # metres each claw opens beyond the magazine side
+CLAW_HOOK = 0.015      # metres the claw tip reaches in under the magazine edge
+VIRTUAL_HOIST = True   # fallback: plain gripper pad if nothing else is available
+PAD_SIZE = (0.35, 0.35, 0.04)  # metres: size of that gripper pad
+HOIST_SPEED = 0.3      # metres / second, up and down
+GRIP_CLEARANCE = 0.0   # metres left between gripper bottom and magazine top
+GRIP_TIME = 1.0        # seconds to close / open the gripper
+PAUSE_TIME = 0.5       # seconds to wait between steps
+STOW_INSIDE = True     # lift the magazine up inside the OHT body for travel
+STOW_MARGIN = 0.01     # metres the magazine bottom sits above the body bottom
+CABLE_PATH = "/World/OHT_Hoist_Cables"
+CABLE_WIDTH = 0.008    # metres
+# Optional gripper fingers: (prim path, closing offset in metres in the
+# finger's parent space). Leave empty if the gripper has no moving parts.
+GRIPPER_FINGERS = [
+    # ("/World/OHT2grip_Revised/Gripper/Finger_L", (0.0,  0.03, 0.0)),
+    # ("/World/OHT2grip_Revised/Gripper/Finger_R", (0.0, -0.03, 0.0)),
+]
+
+# ------------------------------------------------------------
+# Units and up axis
+# ------------------------------------------------------------
+MPU = UsdGeom.GetStageMetersPerUnit(stage) or 1.0
+U = 1.0 / MPU
+speed_u = SPEED * U
+step_u = SAMPLE_STEP * U
+snap_u = SNAP_TOL * U
+junction_u = JUNCTION_RADIUS * U
+half_span_u = 0.5 * HEADING_SPAN * U
+height_u = HEIGHT_OFFSET * U
+rail_offset_u = MAX_RAIL_OFFSET * U
+hoist_speed_u = HOIST_SPEED * U
+clearance_u = GRIP_CLEARANCE * U
+
+Z_UP = UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z
+UP_VEC = np.array([0.0, 0.0, 1.0]) if Z_UP else np.array([0.0, 1.0, 0.0])
+UP_GF = Gf.Vec3d(*UP_VEC)
+UP_I = 2 if Z_UP else 1
+H_IDX = [0, 1] if Z_UP else [0, 2]   # horizontal axes
+
+
+def heading_deg(d):
+    if Z_UP:
+        return math.degrees(math.atan2(d[1], d[0]))
+    return math.degrees(math.atan2(-d[2], d[0]))
+
+
+def unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+
+# ============================================================
+# FIND OHT
+# ============================================================
+oht = stage.GetPrimAtPath(OHT_HINT)
+if not oht.IsValid():
+    candidates = [p for p in stage.Traverse() if "oht" in p.GetName().lower()
+                  and not str(p.GetPath()).startswith(DEBUG_ROOT)]
+    if not candidates:
+        raise RuntimeError("No OHT found. Check the OHT model in the Stage panel.")
+    oht = candidates[0]
+print("OHT FOUND:", oht.GetPath())
+for _path in HIDE_PRIMS:
+    _p = stage.GetPrimAtPath(_path)
+    if _p.IsValid() and _p != oht:
+        UsdGeom.Imageable(_p).MakeInvisible()
+        print("HIDDEN:", _path)
+# remove a leftover "mount" op in case this prim was used as a hoist before
+_xf = UsdGeom.Xformable(oht)
+_ops = [op for op in _xf.GetOrderedXformOps() if op.GetOpName() != "xformOp:transform:mount"]
+if len(_ops) != len(_xf.GetOrderedXformOps()):
+    _xf.SetXformOpOrder(_ops)
+
+# ============================================================
+# CURVE SAMPLING
+# ============================================================
+def _count(ctrl):
+    length = float(np.sum(np.linalg.norm(np.diff(ctrl, axis=0), axis=1)))
+    return max(2, int(math.ceil(length / step_u)) + 1)
+
+
+def _t(k):
+    return np.linspace(0.0, 1.0, k)[:, None]
+
+
+def _linear(q, k):
+    return q[0] + (q[1] - q[0]) * _t(k)
+
+
+def _bezier(q, k):
+    t = _t(k)
+    m = 1.0 - t
+    return m**3 * q[0] + 3 * m**2 * t * q[1] + 3 * m * t**2 * q[2] + t**3 * q[3]
+
+
+def _catmull(q, k):
+    t = _t(k)
+    return 0.5 * (2 * q[1] + (-q[0] + q[2]) * t
+                  + (2 * q[0] - 5 * q[1] + 4 * q[2] - q[3]) * t**2
+                  + (-q[0] + 3 * q[1] - 3 * q[2] + q[3]) * t**3)
+
+
+def _bspline(q, k):
+    t = _t(k)
+    return ((1 - t)**3 * q[0]
+            + (3 * t**3 - 6 * t**2 + 4) * q[1]
+            + (-3 * t**3 + 3 * t**2 + 3 * t + 1) * q[2]
+            + t**3 * q[3]) / 6.0
+
+
+def _join(segs):
+    if not segs:
+        return None
+    return np.vstack([segs[0]] + [s[1:] for s in segs[1:]])
+
+
+def sample_curve(cp, ctype, basis, wrap):
+    n = len(cp)
+    if n < 2:
+        return None
+    if ctype == "linear" or n < 4:
+        if wrap == "periodic":
+            cp = np.vstack([cp, cp[:1]])
+        return _join([_linear(cp[i:i + 2], _count(cp[i:i + 2]))
+                      for i in range(len(cp) - 1)])
+    if basis == "bezier":
+        if wrap == "periodic":
+            cp = np.vstack([cp, cp[:1]])
+        return _join([_bezier(cp[i:i + 4], _count(cp[i:i + 4]))
+                      for i in range(0, len(cp) - 3, 3)])
+    fn = _catmull if basis == "catmullRom" else _bspline
+    if wrap == "periodic":
+        quads = [cp[[(i - 1) % n, i, (i + 1) % n, (i + 2) % n]] for i in range(n)]
+    else:
+        if wrap == "pinned":
+            if basis == "catmullRom":
+                cp = np.vstack([2 * cp[0] - cp[1], cp, 2 * cp[-1] - cp[-2]])
+            else:
+                cp = np.vstack([cp[:1], cp[:1], cp, cp[-1:], cp[-1:]])
+        quads = [cp[i:i + 4] for i in range(len(cp) - 3)]
+    return _join([fn(q, _count(q)) for q in quads])
+
+
+def dedupe(pts):
+    keep = [0]
+    for i in range(1, len(pts)):
+        if np.linalg.norm(pts[i] - pts[keep[-1]]) > 1e-6 * U:
+            keep.append(i)
+    return pts[keep]
+
+
+def cumlen(pts):
+    return np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+
+
+# ============================================================
+# COLLECT EVERY CURVE UNDER THE NETWORK ROOT
+# ============================================================
+root = stage.GetPrimAtPath(TRACK_ROOT)
+if not root.IsValid():
+    raise RuntimeError("Track root not found: " + TRACK_ROOT)
+
+edges_raw = []
+for prim in Usd.PrimRange(root):
+    if not prim.IsA(UsdGeom.BasisCurves):
+        continue
+    bc = UsdGeom.BasisCurves(prim)
+    ctype = str(bc.GetTypeAttr().Get() or "cubic")
+    basis = str(bc.GetBasisAttr().Get() or "bezier")
+    wrap = str(bc.GetWrapAttr().Get() or "nonperiodic")
+    pts = bc.GetPointsAttr().Get()
+    counts = bc.GetCurveVertexCountsAttr().Get()
+    if not pts or not counts:
+        continue
+    raw = np.array(pts, dtype=float)
+    M = np.array(UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(TIME))
+    raw_w = (np.c_[raw, np.ones(len(raw))] @ M)[:, :3]
+    n_before = len(edges_raw)
+    off = 0
+    for c in counts:
+        s = sample_curve(raw_w[off:off + c], ctype, basis, wrap)
+        off += c
+        if s is not None:
+            s = dedupe(s)
+            if len(s) >= 2:
+                edges_raw.append(s)
+    print(f"  {prim.GetPath()}: {len(counts)} curves, type={ctype}, "
+          f"basis={basis}, wrap={wrap} -> {len(edges_raw) - n_before} edges")
+
+if not edges_raw:
+    raise RuntimeError("No BasisCurves found under " + TRACK_ROOT)
+
+# ============================================================
+# SPLIT EDGES AT T-JUNCTIONS
+# ============================================================
+all_pts = np.vstack(edges_raw)
+owner = np.concatenate([np.full(len(e), i) for i, e in enumerate(edges_raw)])
+local = np.concatenate([np.arange(len(e)) for e in edges_raw])
+ends = np.array([e[0] for e in edges_raw] + [e[-1] for e in edges_raw])
+cums = [cumlen(e) for e in edges_raw]
+
+try:
+    from scipy.spatial import cKDTree
+    hits = cKDTree(all_pts).query_ball_point(ends, snap_u)
+except ImportError:
+    hits = [np.nonzero(np.linalg.norm(all_pts - p, axis=1) < snap_u)[0] for p in ends]
+
+cuts = [set() for _ in edges_raw]
+for k, h in enumerate(hits):
+    best = {}
+    for j in h:
+        ei, li = int(owner[j]), int(local[j])
+        d = np.linalg.norm(all_pts[j] - ends[k])
+        if ei not in best or d < best[ei][1]:
+            best[ei] = (li, d)
+    for ei, (li, _) in best.items():
+        if snap_u < cums[ei][li] < cums[ei][-1] - snap_u:
+            cuts[ei].add(li)
+
+pieces = []
+for ei, e in enumerate(edges_raw):
+    idx = [0] + sorted(cuts[ei]) + [len(e) - 1]
+    for a, b in zip(idx[:-1], idx[1:]):
+        if b > a:
+            pieces.append(e[a:b + 1].copy())
+
+# ============================================================
+# BUILD GRAPH
+# ============================================================
+node_pos = []
+grid = defaultdict(list)
+
+
+def node_id(p):
+    cell = tuple(np.floor(p / snap_u).astype(int))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                for nid in grid[(cell[0] + dx, cell[1] + dy, cell[2] + dz)]:
+                    if np.linalg.norm(node_pos[nid] - p) < snap_u:
+                        return nid
+    node_pos.append(p.copy())
+    grid[cell].append(len(node_pos) - 1)
+    return len(node_pos) - 1
+
+
+E = []
+out_edges = defaultdict(list)
+
+
+def add_edge(pts, twin=None):
+    c = cumlen(pts)
+    E.append({"pts": pts, "cum": c, "L": float(c[-1]),
+              "n0": node_id(pts[0]), "n1": node_id(pts[-1]), "twin": twin})
+    out_edges[E[-1]["n0"]].append(len(E) - 1)
+    return len(E) - 1
+
+
+for p in pieces:
+    if cumlen(p)[-1] < 1e-6 * U:
+        continue
+    a = add_edge(p)
+    if BIDIRECTIONAL:
+        b = add_edge(p[::-1].copy(), twin=a)
+        E[a]["twin"] = b
+
+
+def point_on(e, s):
+    cum = e["cum"]
+    s = min(max(s, 0.0), e["L"])
+    i = int(np.searchsorted(cum, s, side="right")) - 1
+    i = min(max(i, 0), len(cum) - 2)
+    seg = cum[i + 1] - cum[i]
+    t = 0.0 if seg <= 0 else (s - cum[i]) / seg
+    return e["pts"][i] + (e["pts"][i + 1] - e["pts"][i]) * t
+
+
+def exit_dir(e):
+    return unit(e["pts"][-1] - point_on(e, e["L"] - 2 * half_span_u))
+
+
+def entry_dir(e):
+    return unit(point_on(e, 2 * half_span_u) - e["pts"][0])
+
+
+def successors(eid):
+    """Edges the OHT can drive onto from the end of eid (no U-turns)."""
+    e = E[eid]
+    d = exit_dir(e)
+    return [c for c in out_edges[e["n1"]]
+            if c != e["twin"] and np.dot(d, entry_dir(E[c])) > 0.0]
+
+
+# ------------------------------------------------------------
+# BUILD THE MISSING JUNCTION PIECES
+# The waypoint network only holds the straight rails; the curves and the
+# short straights inside each junction block are missing. For every rail
+# end that connects to nothing, connect it to every other loose rail end
+# nearby that the OHT could physically drive into: straight on, or a
+# smooth curve of up to MAX_TURN_DEG.
+# ------------------------------------------------------------
+def hermite(p0, d0, p1, d1, k):
+    t = _t(k)
+    L = np.linalg.norm(p1 - p0)
+    h00 = 2 * t**3 - 3 * t**2 + 1
+    h10 = t**3 - 2 * t**2 + t
+    h01 = -2 * t**3 + 3 * t**2
+    h11 = t**3 - t**2
+    return h00 * p0 + h10 * L * d0 + h01 * p1 + h11 * L * d1
+
+
+def connector(p0, d0, p1, d1):
+    """Smooth path from p0 (heading d0) to p1 (arriving with heading d1)."""
+    gap = p1 - p0
+    k = max(6, int(math.ceil(np.linalg.norm(gap) * 1.6 / step_u)) + 1)
+    # corner turn: quadratic Bezier through the point where both rails meet
+    A = np.column_stack([d0, -d1])
+    sol, *_ = np.linalg.lstsq(A, gap, rcond=None)
+    a, b = sol
+    if np.linalg.norm(np.cross(d0, d1)) > 0.3 and a > 0 and b > 0:
+        c = p0 + a * d0
+        t = _t(k)
+        return (1 - t)**2 * p0 + 2 * (1 - t) * t * c + t**2 * p1
+    return hermite(p0, d0, p1, d1, k)
+
+
+# loose rail ends = nodes touched by exactly one rail
+rails_at = defaultdict(set)
+for i, e in enumerate(E):
+    key = min(i, e["twin"]) if e["twin"] is not None else i
+    rails_at[e["n0"]].add(key)
+    rails_at[e["n1"]].add(key)
+loose = {n for n, r in rails_at.items() if len(r) == 1}
+
+cos_max_turn = math.cos(math.radians(MAX_TURN_DEG))
+node_arr = np.array(node_pos)
+bridge_ids = []
+for eid in range(len(E)):
+    e = E[eid]
+    if successors(eid):
+        continue
+    p, d = e["pts"][-1], exit_dir(e)
+    dist = np.linalg.norm(node_arr - p, axis=1)
+    for nid in np.nonzero(dist < junction_u)[0]:
+        nid = int(nid)
+        if nid == e["n1"] or nid == e["n0"] or nid not in loose:
+            continue
+        g = unit(node_arr[nid] - p)
+        for c in out_edges[nid]:
+            d1 = entry_dir(E[c])
+            if np.dot(g, d) < 0.3 or np.dot(g, d1) < 0.3:      # must lie ahead
+                continue
+            if np.dot(d, d1) < cos_max_turn:                    # no U-turns
+                continue
+            bridge_ids.append(add_edge(connector(p, d, node_arr[nid], d1)))
+
+bridges = len(bridge_ids)
+
+dead = [eid for eid in range(len(E)) if not successors(eid)]
+print(f"TRACK GRAPH: {len(E)} edges, {len(node_pos)} nodes, "
+      f"{bridges} junction connections built, {len(dead)} dead ends left")
+
+# ============================================================
+# START: nearest rail to the OHT, in the direction that goes furthest
+# ============================================================
+m = UsdGeom.Xformable(oht).ComputeLocalToWorldTransform(TIME)
+oht_pos = np.array([m[3][0], m[3][1], m[3][2]], dtype=float)
+
+ranked = []
+for i, e in enumerate(E):
+    d = np.linalg.norm(e["pts"] - oht_pos, axis=1)
+    j = int(np.argmin(d))
+    ranked.append((float(d[j]), i, float(e["cum"][j])))
+ranked.sort()
+
+
+def reachable(start):
+    seen, stack = {start}, [start]
+    while stack:
+        for n in successors(stack.pop()):
+            if n not in seen:
+                seen.add(n)
+                stack.append(n)
+    return len(seen)
+
+
+_, start_edge, start_s = ranked[0]
+twin = E[start_edge]["twin"]
+if twin is not None and reachable(twin) > reachable(start_edge):
+    start_s = E[start_edge]["L"] - start_s
+    start_edge = twin
+print(f"START: {ranked[0][0] * MPU:.3f} m from rail, "
+      f"{reachable(start_edge)} edges reachable ahead")
+
+# ============================================================
+# DEBUG DRAWING (yellow = rail ends that connect to nothing)
+# ============================================================
+stage.RemovePrim(DEBUG_ROOT)
+UsdGeom.Xform.Define(stage, DEBUG_ROOT)
+if dead and SHOW_DEAD_END_MARKERS:
+    dp = UsdGeom.Points.Define(stage, DEBUG_ROOT + "/Dead_Ends")
+    dp.CreatePointsAttr(Vt.Vec3fArray(
+        [Gf.Vec3f(*map(float, E[i]["pts"][-1] + UP_VEC * 0.05 * U)) for i in dead]))
+    dp.CreateWidthsAttr(Vt.FloatArray([0.25 * U] * len(dead)))
+    dp.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(1, 1, 0)]))
+
+if bridge_ids:
+    jc = UsdGeom.BasisCurves.Define(stage, DEBUG_ROOT + "/Junction_Connections")
+    jc.CreateTypeAttr(UsdGeom.Tokens.linear)
+    pts_all, cnts = [], []
+    for i in bridge_ids:
+        pts_all += [Gf.Vec3f(*map(float, q + UP_VEC * 0.05 * U)) for q in E[i]["pts"]]
+        cnts.append(len(E[i]["pts"]))
+    jc.CreatePointsAttr(Vt.Vec3fArray(pts_all))
+    jc.CreateCurveVertexCountsAttr(Vt.IntArray(cnts))
+    jc.CreateWidthsAttr(Vt.FloatArray([0.04 * U]))
+    jc.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+    jc.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0, 1, 1)]))
+    UsdGeom.Imageable(jc.GetPrim()).MakeInvisible()
+
+# Hide the complete generated debug group, including any endpoint markers.
+UsdGeom.Imageable(stage.GetPrimAtPath(DEBUG_ROOT)).MakeInvisible()
+
+# ============================================================
+# ROUTE CHOICE
+# ============================================================
+def choose_next(eid):
+    cands = successors(eid)
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    d = exit_dir(E[eid])
+    turn = lambda c: np.dot(d, entry_dir(E[c]))   # 1 = straight, lower = turning
+    if AT_JUNCTION == "turn":
+        return min(cands, key=turn)
+    return max(cands, key=turn)
+
+
+def route_point(prev, cur, nxt, s):
+    L = E[cur]["L"]
+    if s > L and nxt is not None:
+        return point_on(E[nxt], s - L)
+    if s < 0 and prev is not None:
+        return point_on(E[prev], E[prev]["L"] + s)
+    return point_on(E[cur], s)
+
+# ============================================================
+# OHT TRANSFORM SETUP
+# ============================================================
+xform = UsdGeom.Xformable(oht)
+OP_NAMES = ["xformOp:translate:oht", "xformOp:orient:oht", "xformOp:scale:oht"]
+BASE_KEY = "ohtFollowerBaseOrient"
+
+stored = oht.GetCustomDataByKey(BASE_KEY)
+gt = Gf.Transform(xform.GetLocalTransformation(TIME))
+if stored is None:
+    q = gt.GetRotation().GetQuat()
+    im = q.GetImaginary()
+    stored = Gf.Vec4d(q.GetReal(), im[0], im[1], im[2])
+    oht.SetCustomDataByKey(BASE_KEY, stored)
+base_rot = Gf.Rotation(Gf.Quatd(stored[0], Gf.Vec3d(stored[1], stored[2], stored[3])))
+
+if [op.GetOpName() for op in xform.GetOrderedXformOps()] != OP_NAMES:
+    base_scale = Gf.Vec3d(gt.GetScale())
+    xform.ClearXformOpOrder()
+    t_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, "oht")
+    o_op = xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble, "oht")
+    s_op = xform.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "oht")
+    s_op.Set(base_scale)
+else:
+    t_op, o_op, s_op = xform.GetOrderedXformOps()
+
+parent = oht.GetParent()
+if parent.IsValid() and parent.GetPath() != stage.GetPseudoRoot().GetPath():
+    parent_inv = UsdGeom.Xformable(parent).ComputeLocalToWorldTransform(TIME).GetInverse()
+else:
+    parent_inv = Gf.Matrix4d(1.0)
+
+
+# filled in below once the OHT's own size is measured
+oht_frame = {"anchor": Gf.Vec3d(0, 0, 0), "yaw": 0.0}
+
+
+def apply_pose(world_pos, world_dir):
+    """Put the OHT's rail anchor (top centre of the body) on the rail point,
+    turned to the rail direction."""
+    ld = parent_inv.TransformDir(Gf.Vec3d(*map(float, world_dir)))
+    yaw = heading_deg(ld) + YAW_OFFSET_DEG + oht_frame["yaw"]
+    rot = base_rot * Gf.Rotation(UP_GF, yaw)
+    wp = world_pos + UP_VEC * height_u
+    lp = parent_inv.Transform(Gf.Vec3d(*map(float, wp)))
+    t_op.Set(lp - rot.TransformDir(oht_frame["anchor"]))
+    o_op.Set(rot.GetQuat())
+
+
+# ============================================================
+# HELPERS: extra xform ops, bounding boxes, hoist lookup
+# ============================================================
+def front_op(prim, suffix, kind):
+    """Get or create an op placed FIRST in the op order, so it moves the prim
+    in its parent's space without touching the prim's own transform."""
+    xf = UsdGeom.Xformable(prim)
+    name = f"xformOp:{kind}:{suffix}"
+    ops = list(xf.GetOrderedXformOps())
+    for op in ops:
+        if op.GetOpName() == name:
+            return op
+    if kind == "translate":
+        op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble, suffix)
+        op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+    else:
+        op = xf.AddTransformOp(UsdGeom.XformOp.PrecisionDouble, suffix)
+        op.Set(Gf.Matrix4d(1.0))
+    xf.SetXformOpOrder([op] + ops)
+    return op
+
+
+def world_matrix(prim):
+    return UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(TIME)
+
+
+def parent_world(prim):
+    par = prim.GetParent()
+    if par.IsValid() and par.GetPath() != stage.GetPseudoRoot().GetPath():
+        return world_matrix(par)
+    return Gf.Matrix4d(1.0)
+
+
+def world_bounds(prim):
+    cache = UsdGeom.BBoxCache(TIME, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    r = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    return np.array(r.GetMin(), dtype=float), np.array(r.GetMax(), dtype=float)
+
+
+def _too_big(p):
+    """True if p is (nearly) the whole OHT rather than a gripper part."""
+    if p == oht or str(oht.GetPath()).startswith(str(p.GetPath()) + "/"):
+        return True
+    try:
+        o_lo, o_hi = world_bounds(oht)
+        h_lo, h_hi = world_bounds(p)
+    except Exception:
+        return False
+    o = np.maximum(o_hi - o_lo, 1e-9)
+    h = np.maximum(h_hi - h_lo, 0.0)
+    return float(np.prod(h) / np.prod(o)) > 0.5
+
+
+def list_oht_parts(max_depth=4, limit=60):
+    """Print the OHT's parts with size and how low they hang."""
+    o_lo, _ = world_bounds(oht)
+    root_depth = str(oht.GetPath()).count("/")
+    rows = []
+    for p in Usd.PrimRange(oht):
+        depth = str(p.GetPath()).count("/") - root_depth
+        if p == oht or depth > max_depth or not p.IsA(UsdGeom.Xformable):
+            continue
+        if "virtual_hoist" in str(p.GetPath()).lower():
+            continue
+        lo, hi = world_bounds(p)
+        if not (np.all(np.isfinite(lo)) and np.all(hi >= lo)):
+            continue
+        rows.append((depth, str(p.GetPath()), (hi - lo) * MPU,
+                     (lo[UP_I] - o_lo[UP_I]) * MPU))
+    print("-" * 60)
+    print("PARTS INSIDE THE OHT (size in m; bottom = height above the OHT's lowest point)")
+    for depth, path, size, bot in rows[:limit]:
+        print(f"  {'  ' * (depth - 1)}{path}   size {np.round(size, 2)}  bottom {bot:.2f}")
+    if len(rows) > limit:
+        print(f"  ... {len(rows) - limit} more")
+    print("Put the gripper plate (and parts that go down with it) in HOIST_PATHS.")
+    print("-" * 60)
+
+
+def find_hoist_parts():
+    paths = list(HOIST_PATHS) or ([HOIST_PATH] if HOIST_PATH else [])
+    if paths:
+        parts = []
+        for path in paths:
+            p = stage.GetPrimAtPath(path)
+            if not p.IsValid():
+                print("HOIST PART NOT FOUND:", path)
+            elif _too_big(p):
+                print("IGNORED AS HOIST (that is the whole OHT body):", path)
+            else:
+                parts.append(p)
+        return parts
+    for word in ("hoist", "gripper", "grip"):
+        for p in Usd.PrimRange(oht):
+            name = p.GetName().lower()
+            if (p != oht and word in name and p.IsA(UsdGeom.Xformable)
+                    and "virtual_hoist" not in str(p.GetPath()).lower()
+                    and not _too_big(p)):
+                return [p]
+    return []
+
+
+def ease(a):
+    return a * a * (3.0 - 2.0 * a)
+
+
+def make_virtual_hoist():
+    """A gripper pad attached under the OHT body, used as the hoist."""
+    path = str(oht.GetPath()) + "/Virtual_Hoist"
+    stage.RemovePrim(path)
+    lo, hi = world_bounds(oht)
+    bottom = 0.5 * (lo + hi)
+    bottom[UP_I] = lo[UP_I]
+    want = Gf.Matrix4d(1.0).SetTranslate(Gf.Vec3d(*map(float, bottom)))
+    xf = UsdGeom.Xform.Define(stage, path)
+    # local = wanted world pose in the OHT's space (cancels the OHT's scale)
+    xf.AddTransformOp(UsdGeom.XformOp.PrecisionDouble).Set(
+        want * world_matrix(oht).GetInverse())
+    pad = UsdGeom.Cube.Define(stage, path + "/Pad")
+    pad.CreateSizeAttr(1.0)
+    half_h = 0.5 * PAD_SIZE[2] * U
+    pad.AddTranslateOp().Set(Gf.Vec3d(*map(float, -UP_VEC * half_h)))
+    sx, sy, sz = (v * U for v in PAD_SIZE)
+    pad.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz) if Z_UP else Gf.Vec3f(sx, sz, sy))
+    pad.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.9, 0.5, 0.1)]))
+    return xf.GetPrim()
+    UsdGeom.Imageable(dp.GetPrim()).MakeInvisible()
+
+
+# filled by make_hoist_unit()
+hoist_unit = {"plate": None, "claws": [], "open": 0.0, "closed": 0.0, "cables": []}
+
+
+def make_hoist_unit():
+    """Hoist plate with a claw on the front and back, tucked inside the
+    bottom of the OHT body. It is lowered on cables; the claws close on the
+    magazine sides with their tips under its edge."""
+    path = str(oht.GetPath()) + "/Hoist_Unit"
+    stage.RemovePrim(path)
+    stage.RemovePrim(str(oht.GetPath()) + "/Virtual_Hoist")
+
+    # frame: forward = OHT long side, up = world up
+    M = world_matrix(oht)
+    horiz = [i for i in range(3) if i != up_i]
+    size = {i: (o_hi - o_lo)[i] * scale_vec[i] for i in horiz}
+    long_ax = max(horiz, key=size.get)
+    fwd = np.array(M.TransformDir(Gf.Vec3d(*np.eye(3)[long_ax])), dtype=float)
+    fwd = unit(fwd - np.dot(fwd, UP_VEC) * UP_VEC)
+    lat = unit(np.cross(UP_VEC, fwd))
+    if Z_UP:
+        rows = [fwd, lat, UP_VEC]
+        L = lambda f, l, u: Gf.Vec3d(float(f), float(l), float(u))
+    else:
+        rows = [fwd, UP_VEC, unit(np.cross(fwd, UP_VEC))]
+        L = lambda f, l, u: Gf.Vec3d(float(f), float(u), float(l))
+
+    # sizes from the magazine
+    if load is not None:
+        lo, hi = world_bounds(load)
+        ext = hi - lo
+        Lf = abs(fwd[H_IDX[0]]) * ext[H_IDX[0]] + abs(fwd[H_IDX[1]]) * ext[H_IDX[1]]
+        Ll = abs(lat[H_IDX[0]]) * ext[H_IDX[0]] + abs(lat[H_IDX[1]]) * ext[H_IDX[1]]
+        Hm = ext[UP_I]
+    else:
+        Lf = Ll = Hm = 0.3 * U
+    plate_t, claw_t = 0.03 * U, 0.012 * U
+    hook = CLAW_HOOK * U
+    arm = float(np.clip(0.3 * Hm, 0.04 * U, 0.12 * U))
+    PL, PW = max(0.9 * Lf, 0.1 * U), max(0.8 * Ll, 0.1 * U)
+    claw_w = max(0.5 * Ll, 0.05 * U)
+    closed = 0.5 * Lf + 0.5 * claw_t + 0.002 * U
+    opened = closed + CLAW_OPEN * U
+
+    # rest position: tucked up inside the bottom of the body
+    b_lo, b_hi = world_bounds(oht)
+    tuck = min(plate_t + arm, 0.45 * (b_hi - b_lo)[UP_I])
+    origin = oht_bottom_world() + UP_VEC * tuck
+    vals = [*rows[0], 0.0, *rows[1], 0.0, *rows[2], 0.0, *origin, 1.0]
+    W = Gf.Matrix4d(*[float(v) for v in vals])
+
+    xf = UsdGeom.Xform.Define(stage, path)
+    xf.AddTransformOp(UsdGeom.XformOp.PrecisionDouble).Set(W * M.GetInverse())
+
+    def box(p, centre, dims, colour):
+        c = UsdGeom.Cube.Define(stage, p)
+        c.CreateSizeAttr(1.0)
+        c.AddTranslateOp().Set(centre)
+        c.AddScaleOp().Set(Gf.Vec3f(*map(float, dims)))
+        c.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*colour)]))
+        return c
+
+    plate = box(path + "/Plate", L(0, 0, -0.5 * plate_t), L(PL, PW, plate_t),
+                (0.85, 0.85, 0.85))
+    claws = []
+    for name, sgn in (("Claw_Front", 1.0), ("Claw_Back", -1.0)):
+        cx = UsdGeom.Xform.Define(stage, f"{path}/{name}")
+        op = cx.AddTranslateOp()
+        op.Set(L(sgn * opened, 0, 0))
+        box(f"{path}/{name}/Arm", L(0, 0, -plate_t - 0.5 * arm),
+            L(claw_t, claw_w, arm), (0.3, 0.3, 0.32))
+        box(f"{path}/{name}/Tip", L(-sgn * 0.5 * hook, 0, -plate_t - arm + 0.5 * claw_t),
+            L(hook + claw_t, claw_w, claw_t), (0.3, 0.3, 0.32))
+        claws.append((op, sgn))
+
+    hoist_unit.update(plate=plate.GetPrim(), claws=claws, open=opened, closed=closed,
+                      L=L, cables=[L(f * 0.35 * PL, l * 0.35 * PW, 0.0)
+                                   for f in (-1, 1) for l in (-1, 1)])
+    print(f"HOIST UNIT built: plate {PL * MPU:.2f} x {PW * MPU:.2f} m, "
+          f"claws on the front and back, arm {arm * MPU:.2f} m")
+    return xf.GetPrim()
+
+
+def set_claws(a):
+    """a = 0 open, 1 closed."""
+    hu = hoist_unit
+    for op, sgn in hu["claws"]:
+        op.Set(hu["L"](sgn * (hu["open"] + (hu["closed"] - hu["open"]) * a), 0, 0))
+
+
+def translate_m(v):
+    m = Gf.Matrix4d(1.0)
+    m.SetTranslate(Gf.Vec3d(*map(float, v)))
+    return m
+
+
+def local_bounds(prim):
+    cache = UsdGeom.BBoxCache(TIME, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    r = cache.ComputeUntransformedBound(prim).ComputeAlignedRange()
+    return np.array(r.GetMin(), dtype=float), np.array(r.GetMax(), dtype=float)
+
+
+def up_axis(to_world_dir):
+    """Which local axis points up in the world, and with which sign."""
+    axes = [np.array(to_world_dir(Gf.Vec3d(*np.eye(3)[i])), dtype=float) for i in range(3)]
+    i = int(np.argmax([abs(np.dot(unit(a), UP_VEC)) for a in axes]))
+    return i, (1.0 if np.dot(axes[i], UP_VEC) > 0 else -1.0), axes
+
+
+def face_centre(lo, hi, ax, sign, top=True):
+    c = 0.5 * (lo + hi)
+    c[ax] = (hi if (sign > 0) == top else lo)[ax]
+    return c
+
+
+# --- measure the OHT body in its own space (without the old gripper pad) ---
+stage.RemovePrim(str(oht.GetPath()) + "/Virtual_Hoist")
+stage.RemovePrim(str(oht.GetPath()) + "/Hoist_Unit")
+o_lo, o_hi = local_bounds(oht)
+scale_vec = np.array(s_op.Get(), dtype=float)
+up_i, up_s, axes = up_axis(base_rot.TransformDir)
+anchor_local = face_centre(o_lo, o_hi, up_i, up_s, top=True)
+oht_bottom_local = face_centre(o_lo, o_hi, up_i, up_s, top=False)
+oht_frame["anchor"] = Gf.Vec3d(*map(float, anchor_local * scale_vec))
+if AUTO_ALIGN:
+    horiz = [i for i in range(3) if i != up_i]
+    size = {i: (o_hi - o_lo)[i] * scale_vec[i] for i in horiz}
+    long_i = max(horiz, key=size.get)
+    oht_frame["yaw"] = -heading_deg(axes[long_i])
+    print(f"OHT ALIGN: long side = local {'XYZ'[long_i]} axis, "
+          f"turned {oht_frame['yaw']:.0f} deg; top centre placed on the rail")
+
+
+def oht_bottom_world():
+    M = world_matrix(oht)
+    return np.array(M.Transform(Gf.Vec3d(*map(float, oht_bottom_local * 1.0))), dtype=float)
+
+
+MAG_WORDS = ("magazine", "foup", "carrier", "cassette", "mag_", "mag")
+
+
+def find_magazine():
+    if MAGAZINE_PATH:
+        p = stage.GetPrimAtPath(MAGAZINE_PATH)
+        return p if p.IsValid() else None
+    machine = stage.GetPrimAtPath(PICK_MACHINE_PATH)
+    if not machine.IsValid():
+        return None
+    lo, hi = world_bounds(machine)
+    centre = 0.5 * (lo + hi)
+    found = []
+    for p in stage.Traverse():
+        path = str(p.GetPath())
+        if (p == machine or path.startswith(str(oht.GetPath()))
+                or path.startswith(DEBUG_ROOT) or not p.IsA(UsdGeom.Imageable)):
+            continue
+        if not any(w in p.GetName().lower() for w in MAG_WORDS):
+            continue
+        if any(w in p.GetParent().GetName().lower() for w in MAG_WORDS):
+            continue                      # take the top of the magazine model
+        mlo, mhi = world_bounds(p)
+        d = np.linalg.norm((0.5 * (mlo + mhi) - centre)[H_IDX])
+        if d < 1.0 * U:
+            found.append((d, path.count("/"), p))
+    found.sort(key=lambda r: (r[0], r[1]))
+    return found[0][2] if found else None
+
+
+load = find_magazine()
+print("MAGAZINE:", load.GetPath() if load else
+      "NOT FOUND - set MAGAZINE_PATH to the magazine prim on machine 1")
+carry_op = front_op(load, "carry", "transform") if load else None
+load_base_local = None
+load_base_local_inv = None
+if carry_op:
+    carry_op.Set(Gf.Matrix4d(1.0))       # put the magazine back where it started
+    load_base_local = UsdGeom.Xformable(load).GetLocalTransformation(TIME)
+    load_base_local_inv = load_base_local.GetInverse()
+
+
+# reset any part that an earlier run lowered (e.g. the whole body by mistake)
+for _p in Usd.PrimRange(oht):
+    for _op in UsdGeom.Xformable(_p).GetOrderedXformOps() if _p.IsA(UsdGeom.Xformable) else []:
+        if _op.GetOpName() == "xformOp:translate:hoistDrop":
+            _op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+
+if LIST_OHT_PARTS:
+    list_oht_parts()
+user_hoist = bool(HOIST_PATHS or HOIST_PATH)
+hoist_parts = find_hoist_parts() if (user_hoist or not BUILD_HOIST) else []
+if not hoist_parts and BUILD_HOIST:
+    hoist_parts = [make_hoist_unit()]
+    print("HOIST:", hoist_parts[0].GetPath())
+elif not hoist_parts and VIRTUAL_HOIST:
+    hoist_parts = [make_virtual_hoist()]
+    print("HOIST: no gripper part found - using an orange gripper pad",
+          hoist_parts[0].GetPath())
+else:
+    print("HOIST:", [str(p.GetPath()) for p in hoist_parts] or "NOT FOUND - set HOIST_PATHS")
+hoist = hoist_parts[0] if hoist_parts else None
+# A hoist inside the OHT model is lowered with an extra translate op.
+# A hoist that is a separate prim (e.g. a gripper unit lying elsewhere on the
+# rail) is mounted under the OHT and carried along with it.
+hoist_inside = hoist is not None and all(
+    str(p.GetPath()).startswith(str(oht.GetPath()) + "/") for p in hoist_parts)
+hoist_op = mount_op = None
+drop_ops = []                     # one translate op per hoist part
+if hoist is not None:
+    if hoist_inside:
+        for part in hoist_parts:
+            op = front_op(part, "hoistDrop", "translate")
+            op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+            drop_ops.append((part, op))
+        hoist_op = drop_ops[0][1]
+    else:
+        hoist_parts = [hoist]
+        mount_op = front_op(hoist, "mount", "transform")
+        mount_op.Set(Gf.Matrix4d(1.0))
+        print("HOIST is a separate prim - it will be mounted under the OHT")
+hoist_drop = [0.0]
+mount = {}
+
+stage.RemovePrim(CABLE_PATH)
+cable = UsdGeom.BasisCurves.Define(stage, CABLE_PATH)
+cable.CreateTypeAttr(UsdGeom.Tokens.linear)
+cable.CreateWidthsAttr(Vt.FloatArray([CABLE_WIDTH * U]))
+cable.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+cable.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.15, 0.15, 0.15)]))
+cable_pts = cable.CreatePointsAttr()
+cable_cnt = cable.CreateCurveVertexCountsAttr()
+cable_local = []
+
+
+def init_hoist():
+    """Call once the OHT is at its start pose."""
+    if hoist is None:
+        return
+    if mount_op is not None:
+        Hw0 = world_matrix(hoist)
+        P = parent_world(hoist)
+        h_lo, h_hi = world_bounds(hoist)
+        top = 0.5 * (h_lo + h_hi)
+        top[UP_I] = h_hi[UP_I]
+        rel = Hw0 * translate_m(oht_bottom_world() - top) * world_matrix(oht).GetInverse()
+        mount.update(rel=rel, Hw0inv=Hw0.GetInverse(), P=P, Pinv=P.GetInverse())
+    if hoist_unit["cables"]:
+        cable_local[:] = list(hoist_unit["cables"])
+        return
+    # four cable anchor points on the hoist's top face
+    lo, hi = local_bounds(hoist)
+    ax, sg, _ = up_axis(world_matrix(hoist).TransformDir)
+    c = face_centre(lo, hi, ax, sg, top=True)
+    h = [i for i in range(3) if i != ax]
+    cable_local.clear()
+    for s1 in (-1, 1):
+        for s2 in (-1, 1):
+            q = c.copy()
+            q[h[0]] += s1 * 0.35 * (hi - lo)[h[0]]
+            q[h[1]] += s2 * 0.35 * (hi - lo)[h[1]]
+            cable_local.append(Gf.Vec3d(*map(float, q)))
+
+
+def set_drop(d):
+    hoist_drop[0] = d          # negative = lifted above the rest position
+    for part, op in drop_ops:
+        op.Set(parent_world(part).GetInverse().TransformDir(
+            Gf.Vec3d(*map(float, -UP_VEC * hoist_drop[0]))))
+
+
+def update_hoist():
+    if hoist is None:
+        return
+    if mount_op is not None and mount:
+        Hw = mount["rel"] * world_matrix(oht) * translate_m(-UP_VEC * hoist_drop[0])
+        mount_op.Set(mount["P"] * mount["Hw0inv"] * Hw * mount["Pinv"])
+    d = hoist_drop[0]
+    img = UsdGeom.Imageable(cable.GetPrim())
+    if d < 1e-4 * U or not cable_local:
+        img.MakeInvisible()
+        return
+    M = world_matrix(hoist)
+    pts = []
+    for q in cable_local:
+        b = np.array(M.Transform(q), dtype=float)
+        pts += [Gf.Vec3f(*map(float, b)), Gf.Vec3f(*map(float, b + UP_VEC * d))]
+    cable_pts.Set(Vt.Vec3fArray(pts))
+    cable_cnt.Set(Vt.IntArray([2] * len(cable_local)))
+    img.MakeVisible()
+
+fingers = []
+for path, offset in GRIPPER_FINGERS:
+    p = stage.GetPrimAtPath(path)
+    if p.IsValid():
+        op = front_op(p, "gripClose", "translate")
+        op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        fingers.append((op, Gf.Vec3d(*[v * U for v in offset])))
+    else:
+        print("GRIPPER FINGER NOT FOUND:", path)
+
+
+def init_place_target():
+    """Green see-through box showing where the magazine will be set down.
+    Created once, at the same spot relative to machine 2 as the magazine
+    has on machine 1. Move it in the viewport to where it should really go."""
+    prim = stage.GetPrimAtPath(PLACE_TARGET_PATH)
+    if prim.IsValid():
+        UsdGeom.Imageable(prim).MakeInvisible()
+        preview = stage.GetPrimAtPath(PLACE_TARGET_PATH + "/Preview")
+        if preview.IsValid():
+            UsdGeom.Imageable(preview).MakeInvisible()
+        return prim
+    m1 = stage.GetPrimAtPath(PICK_MACHINE_PATH)
+    m2 = stage.GetPrimAtPath(PLACE_MACHINE_PATH)
+    if load is None or not m1.IsValid() or not m2.IsValid():
+        return None
+    lo, hi = world_bounds(load)
+    bc = 0.5 * (lo + hi)
+    bc[UP_I] = lo[UP_I]
+    rel = world_matrix(m1).GetInverse().Transform(Gf.Vec3d(*map(float, bc)))
+    guess = world_matrix(m2).Transform(rel)
+    xf = UsdGeom.Xform.Define(stage, PLACE_TARGET_PATH)
+    tgt_parent = stage.GetPrimAtPath(PLACE_TARGET_PATH).GetParent()
+    pinv = (world_matrix(tgt_parent).GetInverse()
+            if tgt_parent.GetPath() != stage.GetPseudoRoot().GetPath() else Gf.Matrix4d(1.0))
+    xf.AddTranslateOp().Set(pinv.Transform(guess))
+    box = UsdGeom.Cube.Define(stage, PLACE_TARGET_PATH + "/Preview")
+    box.CreateSizeAttr(1.0)
+    ext = hi - lo
+    box.AddTranslateOp().Set(Gf.Vec3d(*map(float, UP_VEC * 0.5 * ext[UP_I])))
+    box.AddScaleOp().Set(Gf.Vec3f(*map(float, ext)))
+    box.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.1, 0.9, 0.2)]))
+    box.CreateDisplayOpacityAttr(Vt.FloatArray([0.35]))
+    UsdGeom.Imageable(xf.GetPrim()).MakeInvisible()
+    UsdGeom.Imageable(box.GetPrim()).MakeInvisible()
+    print(f"DROP TARGET created at {PLACE_TARGET_PATH} - move it inside machine 2 "
+          "if it is not in the right spot, then run again")
+    return stage.GetPrimAtPath(PLACE_TARGET_PATH)
+
+
+place_target = init_place_target() if PLACE_MODE == "target" else None
+
+# ============================================================
+# FIND WHERE TO STOP: rail point closest to the machine
+# ============================================================
+def find_stop(prim, label, point=None):
+    """Stop point on the rail: over the prim's footprint, as close to its
+    centre (or to point) as the rail allows. One entry per driving direction."""
+    if prim is None or not prim.IsValid() or not prim.IsActive():
+        print(label, "NOT FOUND")
+        return None
+    if UsdGeom.Imageable(prim).ComputeVisibility(TIME) == UsdGeom.Tokens.invisible:
+        print(label, "IS HIDDEN - skipping")
+        return None
+    lo, hi = world_bounds(prim)
+    lo_h, hi_h = lo[H_IDX], hi[H_IDX]
+    centre_h = 0.5 * (lo_h + hi_h)
+    if point is not None:
+        centre_h = np.array(point[:2], dtype=float)
+        lo_h = hi_h = centre_h
+
+    rows = []
+    for i, e in enumerate(E):
+        ph = e["pts"][:, H_IDX]
+        outside = np.maximum(np.maximum(lo_h - ph, ph - hi_h), 0.0)
+        d_foot = np.linalg.norm(outside, axis=1)    # 0 = rail is over it
+        d_cent = np.linalg.norm(ph - centre_h, axis=1)
+        key = d_foot * 1000.0 + d_cent
+        j = int(np.argmin(key))
+        rows.append((float(key[j]), float(d_foot[j]), float(d_cent[j]),
+                     i, float(e["cum"][j])))
+    best = min(rows)
+    _, foot, cent = best[:3]
+    if foot > rail_offset_u:
+        print(f"{label}: nearest rail is {foot * MPU:.2f} m outside it "
+              f"(limit {MAX_RAIL_OFFSET} m)")
+        return None
+    where = "over it" if foot == 0 else f"{foot * MPU:.2f} m beside it"
+    print(f"{label}: stop point is {where}, {cent * MPU:.2f} m from its centre")
+    return {i: s for k, f, c, i, s in rows if k <= best[0] + 1e-3 * U}
+
+
+def plan_route(cur, s, targets):
+    """Shortest drive from (cur, s) to any target. Returns (edges after cur, stop_s)."""
+    if cur in targets and targets[cur] >= s:
+        return [], targets[cur]
+    dist, prev, heap = {}, {}, []
+    rem = E[cur]["L"] - s
+    for n in successors(cur):
+        dist[n], prev[n] = rem, None
+        heapq.heappush(heap, (rem, n))
+    while heap:
+        d, e = heapq.heappop(heap)
+        if d > dist.get(e, float("inf")):
+            continue
+        if e in targets:
+            chain, x = [], e
+            while x is not None:
+                chain.append(x)
+                x = prev[x]
+            return chain[::-1], targets[e]
+        for n in successors(e):
+            nd = d + E[e]["L"]
+            if nd < dist.get(n, float("inf")):
+                dist[n], prev[n] = nd, e
+                heapq.heappush(heap, (nd, n))
+    return None, None
+
+# ============================================================
+# CARRYING THE LOAD
+# ============================================================
+carry = {"on": False, "Pinv": None, "H0inv": None, "L0": None}
+
+
+def load_world_op(world_transform):
+    """Set the prepended load op so the complete prim has this world transform."""
+    parent_inv = parent_world(load).GetInverse()
+    carry_op.Set(world_transform * parent_inv * load_base_local_inv)
+
+
+def attach_load():
+    if not (carry_op and hoist):
+        return
+    carry.update(on=True,
+                 Pinv=parent_world(load).GetInverse(),
+                 H0inv=world_matrix(hoist).GetInverse(),
+                 L0=world_matrix(load))
+
+
+def detach_load():
+    carry["on"] = False                  # the magazine stays where it is
+
+
+def carry_update():
+    """Keep the load rigidly fixed to the hoist without changing its local transform."""
+    if carry["on"]:
+        desired_world = carry["L0"] * carry["H0inv"] * world_matrix(hoist)
+        carry_op.Set(desired_world * carry["Pinv"] * load_base_local_inv)
+
+# ============================================================
+# CANCEL OLD TASK
+# ============================================================
+if "oht_follow_task" in globals():
+    old_task = oht_follow_task
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+
+# ============================================================
+# DRIVING
+# ============================================================
+st = {"prev": None, "cur": start_edge, "s": start_s, "nxt": None,
+      "dir": entry_dir(E[start_edge])}
+
+
+def place():
+    a = (st["prev"], st["cur"], st["nxt"])
+    pos = route_point(*a, st["s"])
+    d = route_point(*a, st["s"] + half_span_u) - route_point(*a, st["s"] - half_span_u)
+    if np.linalg.norm(d) > 1e-9:
+        st["dir"] = d
+    apply_pose(pos, st["dir"])
+    update_hoist()
+    carry_update()
+
+
+async def drive(plan=None, stop_s=None):
+    """plan=None: follow the rails freely until a dead end.
+    plan=[edges]: follow exactly those edges, stop at stop_s on the last one."""
+    plan = list(plan) if plan is not None else None
+
+    def pick_next():
+        if plan is not None:
+            return plan.pop(0) if plan else None
+        return choose_next(st["cur"])
+
+    def at_stop():
+        return (plan is not None and stop_s is not None
+                and st["nxt"] is None and st["s"] >= stop_s)
+
+    st["nxt"] = pick_next()
+    last = time.perf_counter()
+    while True:
+        now = time.perf_counter()
+        dt = min(now - last, 0.1)
+        last = now
+        st["s"] += speed_u * dt
+
+        arrived = at_stop()
+        dead_end = False
+        while not arrived and st["s"] >= E[st["cur"]]["L"]:
+            if st["nxt"] is None:
+                st["s"] = E[st["cur"]]["L"]
+                dead_end = True
+                break
+            st["s"] -= E[st["cur"]]["L"]
+            st["prev"], st["cur"] = st["cur"], st["nxt"]
+            st["nxt"] = pick_next()
+            arrived = at_stop()
+        if arrived:
+            st["s"] = stop_s
+
+        place()
+        if arrived:
+            return "arrived"
+        if dead_end:
+            return "dead_end"
+        await app.next_update_async()
+
+
+async def animate(duration, fn):
+    t0 = time.perf_counter()
+    while True:
+        a = 1.0 if duration <= 0 else min((time.perf_counter() - t0) / duration, 1.0)
+        fn(ease(a))
+        update_hoist()
+        carry_update()
+        if a >= 1.0:
+            return
+        await app.next_update_async()
+
+
+async def wait(seconds):
+    await animate(seconds, lambda a: None)
+
+# ============================================================
+# HOIST / GRIPPER SEQUENCES
+# ============================================================
+async def move_hoist(level):
+    start = hoist_drop[0]
+    dist = abs(level - start)
+    t = dist / hoist_speed_u if hoist_speed_u > 0 else 0.0
+    await animate(t, lambda a: set_drop(start + (level - start) * a))
+
+
+async def hoist_cycle(drop, at_bottom, end_level=0.0):
+    """Lower by drop from where the hoist is now, run at_bottom(),
+    then lift to end_level (0 = rest, negative = higher than rest)."""
+    bottom = hoist_drop[0] + max(drop, 0.0)
+    print(f"LOWER HOIST {max(drop, 0.0) * MPU:.3f} m")
+    await move_hoist(bottom)
+    await wait(PAUSE_TIME)
+    await at_bottom()
+    await wait(PAUSE_TIME)
+    print("LIFT HOIST")
+    await move_hoist(end_level(bottom) if callable(end_level) else end_level)
+
+
+async def close_gripper():
+    print("CLOSE GRIPPER")
+
+    def step(a):
+        set_claws(a)
+        for op, off in fingers:
+            op.Set(off * a)
+    await animate(GRIP_TIME, step)
+    attach_load()
+
+
+async def open_gripper():
+    print("OPEN GRIPPER")
+    detach_load()
+
+    def step(a):
+        set_claws(1.0 - a)
+        for op, off in fingers:
+            op.Set(off * (1.0 - a))
+    await animate(GRIP_TIME, step)
+
+
+def hoist_bounds():
+    b = [world_bounds(p) for p in hoist_parts]
+    return np.min([x[0] for x in b], axis=0), np.max([x[1] for x in b], axis=0)
+
+
+hoist_align_op = front_op(hoist, "hoistAlign", "translate") if hoist is not None else None
+if hoist_align_op is not None:
+    hoist_align_op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+
+
+def align_hoist_over(prim):
+    """Shift the hoist horizontally so its center is above the target prim."""
+    if hoist is None or hoist_align_op is None:
+        raise RuntimeError("Cannot align the magazine: no valid hoist is available.")
+    target_lo, target_hi = world_bounds(prim)
+    target = 0.5 * (target_lo + target_hi)
+    hoist_lo, hoist_hi = hoist_bounds()
+    centre = 0.5 * (hoist_lo + hoist_hi)
+    offset = target - centre
+    offset[UP_I] = 0.0
+    local_offset = parent_world(hoist).GetInverse().TransformDir(
+        Gf.Vec3d(*map(float, offset)))
+    hoist_align_op.Set(local_offset)
+    print(f"HOIST HORIZONTAL ALIGN: {np.linalg.norm(offset) * MPU:.3f} m")
+
+
+async def pick_magazine():
+    # body size measured now, with the hoist at rest inside it
+    b_lo, b_hi = world_bounds(oht)
+    h_lo, h_hi = hoist_bounds()
+    _, m_hi = world_bounds(load)
+
+    def stow_level(bottom):
+        """Hoist level that pulls the magazine up inside the body."""
+        if not STOW_INSIDE:
+            return 0.0
+        m_lo, _ = world_bounds(load)               # measured at the bottom
+        # raise until magazine bottom is just above the body bottom ...
+        level = bottom - (b_lo[UP_I] + STOW_MARGIN * U - m_lo[UP_I])
+        # ... but never push the gripper out through the top of the body
+        top_limit = h_hi[UP_I] - b_hi[UP_I]
+        if level < top_limit:
+            print("Magazine is taller than the space in the OHT body - "
+                  "it will stick out underneath")
+            level = top_limit
+        return min(level, 0.0)
+
+    contact_lo = (world_bounds(hoist_unit["plate"])[0] if hoist_unit["plate"] is not None
+                  else h_lo)
+    await hoist_cycle(contact_lo[UP_I] - m_hi[UP_I] - clearance_u, close_gripper, stow_level)
+    print("MAGAZINE PICKED UP" + (" AND STOWED INSIDE THE OHT" if STOW_INSIDE else ""))
+
+
+def mesh_triangles(root_prim, skip=()):
+    """All triangles (world space, shape (n, 3, 3)) of meshes under root_prim."""
+    tris = []
+    for p in Usd.PrimRange(root_prim, Usd.TraverseInstanceProxies()):
+        path = str(p.GetPath())
+        if any(path.startswith(x) for x in skip) or not p.IsA(UsdGeom.Mesh):
+            continue
+        if UsdGeom.Imageable(p).ComputeVisibility(TIME) == UsdGeom.Tokens.invisible:
+            continue
+        mesh = UsdGeom.Mesh(p)
+        pts = mesh.GetPointsAttr().Get(TIME)
+        fvc = mesh.GetFaceVertexCountsAttr().Get(TIME)
+        fvi = mesh.GetFaceVertexIndicesAttr().Get(TIME)
+        if not pts or not fvc or not fvi:
+            continue
+        P = np.array(pts, dtype=float)
+        M = np.array(world_matrix(p))
+        P = (np.c_[P, np.ones(len(P))] @ M)[:, :3]
+        counts = np.array(fvc, dtype=int)
+        idx = np.array(fvi, dtype=int)
+        offs = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        n = counts - 2
+        ok = n > 0
+        if not ok.any():
+            continue
+        face = np.repeat(np.arange(len(counts))[ok], n[ok])
+        k = (np.arange(n[ok].sum())
+             - np.repeat(np.cumsum(n[ok]) - n[ok], n[ok]) + 1)
+        base = offs[face]
+        tris.append(P[np.stack([idx[base], idx[base + k], idx[base + k + 1]], axis=1)])
+    return np.concatenate(tris) if tris else np.zeros((0, 3, 3))
+
+
+def surface_below(tris, xy, start_h):
+    """Height of the highest triangle under horizontal point xy, below start_h."""
+    if len(tris) == 0:
+        return None
+    a, b, c = (tris[:, i, :] for i in range(3))
+    A, B, C = a[:, H_IDX], b[:, H_IDX], c[:, H_IDX]
+    v0, v1, v2 = B - A, C - A, xy - A
+    den = v0[:, 0] * v1[:, 1] - v1[:, 0] * v0[:, 1]
+    good = np.abs(den) > 1e-12
+    den = np.where(good, den, 1.0)
+    u = (v2[:, 0] * v1[:, 1] - v1[:, 0] * v2[:, 1]) / den
+    v = (v0[:, 0] * v2[:, 1] - v2[:, 0] * v0[:, 1]) / den
+    inside = good & (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1 + 1e-6)
+    h = a[:, UP_I] + u * (b[:, UP_I] - a[:, UP_I]) + v * (c[:, UP_I] - a[:, UP_I])
+    h = h[inside & (h <= start_h + 1e-4 * U)]
+    return float(h.max()) if len(h) else None
+
+
+def landing_height():
+    """Highest surface directly under the magazine's footprint."""
+    m_lo, m_hi = world_bounds(load)
+    lo_h, hi_h = m_lo[H_IDX], m_hi[H_IDX]
+    mid, half = 0.5 * (lo_h + hi_h), 0.4 * (hi_h - lo_h)
+    samples = [mid] + [mid + half * np.array(sg) for sg in
+                       ((1, 1), (1, -1), (-1, 1), (-1, -1))]
+    skip = (str(oht.GetPath()), str(load.GetPath()), DEBUG_ROOT, TRACK_ROOT)
+
+    roots = [PLACE_SURFACE_PATH or PLACE_MACHINE_PATH, "/"]
+    for r in roots:
+        prim = stage.GetPrimAtPath(r) if r != "/" else stage.GetPseudoRoot()
+        if not prim.IsValid():
+            continue
+        if r == "/":
+            print("Nothing of machine 2 under the magazine - checking the whole scene")
+        tris = mesh_triangles(prim, skip)
+        hits = [surface_below(tris, xy, m_lo[UP_I]) for xy in samples]
+        hits = [h for h in hits if h is not None]
+        if hits:
+            return max(hits)
+    return None
+
+
+async def place_on_target():
+    target = np.array(world_matrix(place_target).ExtractTranslation(), dtype=float)
+    m_lo, _ = world_bounds(load)
+    drop = m_lo[UP_I] - target[UP_I]
+    print(f"Setting the magazine down on the drop target, lowering {drop * MPU:.3f} m")
+
+    async def at_bottom():
+        detach_load()
+        lo, hi = world_bounds(load)
+        now = 0.5 * (lo + hi)
+        now[UP_I] = lo[UP_I]
+        v = target - now                      # small final correction
+        start_world = world_matrix(load)
+        await animate(0.4, lambda a: load_world_op(
+            start_world * translate_m(v * a)))
+        await open_gripper()
+
+    await hoist_cycle(drop, at_bottom)
+    print("MAGAZINE PLACED")
+
+
+async def place_magazine():
+    if PLACE_MODE == "target" and place_target is not None:
+        await place_on_target()
+        return
+    m_lo, _ = world_bounds(load)
+    top = landing_height()
+    if top is None:
+        print("NO SURFACE FOUND under the magazine - not lowering. "
+              "Check PLACE_POINT / machine 2 position.")
+        return
+    drop = m_lo[UP_I] - top
+    print(f"Surface under magazine at height {top * MPU:.3f} m, "
+          f"lowering {drop * MPU:.3f} m")
+    await hoist_cycle(drop, open_gripper)
+    print("MAGAZINE PLACED")
+
+
+async def go_to(targets, label):
+    """Drive to the stop point; returns True when the OHT is there."""
+    route, stop_s = plan_route(st["cur"], st["s"], targets)
+    tw = E[st["cur"]]["twin"]
+    if route is None and tw is not None:          # try the other direction
+        route, stop_s = plan_route(tw, E[tw]["L"] - st["s"], targets)
+        if route is not None:
+            st["s"] = E[tw]["L"] - st["s"]
+            st["cur"], st["prev"] = tw, None
+    if route is None:
+        print(label, "CANNOT BE REACHED on the rails from here")
+        return False
+    print(f"DRIVING TO {label} ({len(route)} edges)")
+    if await drive(route, stop_s) != "arrived":
+        print("DEAD END before", label)
+        return False
+    print("STOPPED ABOVE", label)
+    await wait(PAUSE_TIME)
+    return True
+
+# ============================================================
+# MAIN SEQUENCE
+# ============================================================
+async def run():
+    print("OHT STARTED")
+    place()
+    init_hoist()
+    update_hoist()
+    try:
+        if hoist is None or load is None:
+            print("Need both a hoist and a magazine - see messages above.")
+            return
+        pick = find_stop(load, "MAGAZINE ON MACHINE 1")
+        if PLACE_MODE == "target" and place_target is not None:
+            tp = np.array(world_matrix(place_target).ExtractTranslation(), dtype=float)
+            drop = find_stop(stage.GetPrimAtPath(PLACE_MACHINE_PATH), "DROP TARGET",
+                             tp[H_IDX])
+        else:
+            pt = None if PLACE_POINT is None else np.array(PLACE_POINT[:2]) * U
+            drop = find_stop(stage.GetPrimAtPath(PLACE_MACHINE_PATH), "MACHINE 2", pt)
+        if not pick:
+            print("Cannot reach the magazine - nothing to do.")
+            return
+
+        if not await go_to(pick, "MACHINE 1"):
+            return
+        align_hoist_over(load)
+        await pick_magazine()
+
+        if not drop:
+            print("HOLDING THE MAGAZINE - the drop spot is not under a rail. "
+                  "Move the drop target under a rail or raise MAX_RAIL_OFFSET.")
+            return
+        if not await go_to(drop, "MACHINE 2"):
+            return
+        await place_magazine()
+        print("TRANSFER COMPLETE")
+
+        if CONTINUE_AFTER_PLACE:
+            await drive()
+            print("OHT REACHED A DEAD END - stopped")
+
+    except asyncio.CancelledError:
+        print("OHT MOVEMENT STOPPED")
+        raise
+    except Exception as error:
+        print("OHT MOVEMENT ERROR:", error)
+        raise
+
+
+oht_follow_task = asyncio.ensure_future(run())
