@@ -1112,7 +1112,7 @@ carry = {"on": False, "Pinv": None, "H0inv": None, "L0": None}
 def load_world_op(world_transform):
     """Set the prepended load op so the complete prim has this world transform."""
     parent_inv = parent_world(load).GetInverse()
-    carry_op.Set(world_transform * parent_inv * load_base_local_inv)
+    carry_op.Set(load_base_local_inv * world_transform * parent_inv)
 
 
 def attach_load():
@@ -1132,7 +1132,7 @@ def carry_update():
     """Keep the load rigidly fixed to the hoist without changing its local transform."""
     if carry["on"]:
         desired_world = carry["L0"] * carry["H0inv"] * world_matrix(hoist)
-        carry_op.Set(desired_world * carry["Pinv"] * load_base_local_inv)
+        carry_op.Set(load_base_local_inv * desired_world * carry["Pinv"])
 
 # ============================================================
 # CANCEL OLD TASK
